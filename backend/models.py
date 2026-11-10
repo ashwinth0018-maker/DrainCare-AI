@@ -7,6 +7,21 @@ from sqlalchemy.orm import Mapped, mapped_column
 from backend.database import Base
 
 
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    username: Mapped[str] = mapped_column(String(100), unique=True, nullable=False, index=True)
+    full_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    email: Mapped[str] = mapped_column(String(150), nullable=False)
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc)
+    )
+
+
 class SensorReading(Base):
     __tablename__ = "sensor_readings"
 
@@ -79,6 +94,13 @@ class MaintenanceBooking(Base):
 
     paypal_order_id: Mapped[str | None] = mapped_column(
         String(100),
+        nullable=True,
+        default=None
+    )
+
+    assigned_worker_id: Mapped[int | None] = mapped_column(
+        Integer,
+        ForeignKey("users.id"),
         nullable=True,
         default=None
     )

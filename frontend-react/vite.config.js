@@ -11,6 +11,10 @@ export default defineConfig({
       '/ai': 'http://127.0.0.1:8000',
       '/bookings': 'http://127.0.0.1:8000',
       '/payment': 'http://127.0.0.1:8000',
+      '/auth': 'http://127.0.0.1:8000',
+      '/resident': 'http://127.0.0.1:8000',
+      '/worker': 'http://127.0.0.1:8000',
+      '/admin': 'http://127.0.0.1:8000',
     },
   },
 })

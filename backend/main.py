@@ -2,19 +2,41 @@ import requests
 from backend.paypal_service import create_paypal_order, capture_paypal_order
 import random
 from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 
 from backend.database import Base, engine, get_db
-from backend.models import SensorReading, Alert, MaintenanceBooking
+from backend.models import SensorReading, Alert, MaintenanceBooking, User
 from datetime import datetime, timezone
 from backend.ai_engine import analyze_drainage_risk
 from fastapi.responses import FileResponse
+from backend.auth import (
+    hash_password,
+    verify_password,
+    create_access_token,
+    get_current_user,
+    require_role,
+)
 
 
 Base.metadata.create_all(bind=engine)
+
+
+# --- Additive column migration (non-destructive) ---
+# Adds assigned_worker_id to maintenance_bookings if it doesn't exist yet.
+# Preserves all existing rows and data.
+with engine.connect() as conn:
+    try:
+        conn.execute(text("SELECT assigned_worker_id FROM maintenance_bookings LIMIT 1"))
+        conn.commit()
+    except Exception:
+        conn.execute(
+            text("ALTER TABLE maintenance_bookings ADD COLUMN assigned_worker_id INTEGER")
+        )
+        conn.commit()
 
 app = FastAPI(
     title="DrainCare AI",
@@ -315,6 +337,7 @@ def get_bookings(db: Session = Depends(get_db)):
             "booking_status": booking.booking_status,
             "payment_status": booking.payment_status,
             "amount": booking.amount,
+            "assigned_worker_id": booking.assigned_worker_id,
             "created_at": booking.created_at
         }
         for booking in bookings
@@ -462,8 +485,454 @@ def paypal_payment_cancel():
     }
 
 
+# ============================================================
+# Authentication & Role-Based Endpoints
+# ============================================================
+
+class RegisterData(BaseModel):
+    username: str
+    full_name: str
+    email: str
+    password: str
+    role: str = Field(pattern="^(resident|worker|admin)$")
 
 
+class ResidentBookingData(BaseModel):
+    phone: str
+    location: str
+    service_type: str
 
-    return readings
 
+class AssignWorkerData(BaseModel):
+    worker_id: int
+
+
+class UpdateJobStatusData(BaseModel):
+    booking_status: str = Field(pattern="^(Pending|Assigned|In Progress|Solved)$")
+
+
+def _booking_dict(booking: MaintenanceBooking) -> dict:
+    return {
+        "booking_id": booking.id,
+        "customer_name": booking.customer_name,
+        "phone": booking.phone,
+        "email": booking.email,
+        "location": booking.location,
+        "service_type": booking.service_type,
+        "booking_status": booking.booking_status,
+        "payment_status": booking.payment_status,
+        "amount": booking.amount,
+        "assigned_worker_id": booking.assigned_worker_id,
+        "created_at": booking.created_at,
+    }
+
+
+@app.post("/auth/register")
+def register(data: RegisterData, db: Session = Depends(get_db)):
+    existing = db.scalar(select(User).where(User.username == data.username))
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already taken")
+
+    user = User(
+        username=data.username,
+        full_name=data.full_name,
+        email=data.email,
+        role=data.role,
+        password_hash=hash_password(data.password),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    token = create_access_token({"sub": str(user.id), "role": user.role})
+
+    return {
+        "message": "User registered successfully",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "full_name": user.full_name,
+            "email": user.email,
+            "role": user.role,
+        },
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+
+@app.post("/auth/login")
+def login(
+    form: OAuth2PasswordRequestForm = Depends(),
+    db: Session = Depends(get_db),
+):
+    user = db.scalar(select(User).where(User.username == form.username))
+    if user is None or not verify_password(form.password, user.password_hash):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password",
+        )
+
+    token = create_access_token({"sub": str(user.id), "role": user.role})
+
+    return {
+        "message": "Login successful",
+        "user": {
+            "id": user.id,
+            "username": user.username,
+            "full_name": user.full_name,
+            "email": user.email,
+            "role": user.role,
+        },
+        "access_token": token,
+        "token_type": "bearer",
+    }
+
+
+@app.get("/auth/me")
+def get_me(current_user: User = Depends(get_current_user)):
+    return {
+        "id": current_user.id,
+        "username": current_user.username,
+        "full_name": current_user.full_name,
+        "email": current_user.email,
+        "role": current_user.role,
+    }
+
+
+# --- Resident endpoints ---
+
+@app.get("/resident/status")
+def resident_live_status(
+    current_user: User = Depends(require_role("resident")),
+    db: Session = Depends(get_db),
+):
+    latest = db.scalar(
+        select(SensorReading).order_by(SensorReading.id.desc())
+    )
+
+    if latest is None:
+        return {
+            "sensor_id": None,
+            "location": None,
+            "water_level": None,
+            "temperature": None,
+            "gas_level": None,
+            "status": "No data",
+            "created_at": None,
+            "risk": None,
+        }
+
+    risk = analyze_drainage_risk(
+        latest.water_level, latest.temperature, latest.gas_level
+    )
+
+    return {
+        "sensor_id": latest.sensor_id,
+        "location": latest.location,
+        "water_level": latest.water_level,
+        "temperature": latest.temperature,
+        "gas_level": latest.gas_level,
+        "status": latest.status,
+        "created_at": latest.created_at,
+        "risk": risk,
+    }
+
+
+@app.get("/resident/alerts")
+def resident_alerts(
+    current_user: User = Depends(require_role("resident")),
+    db: Session = Depends(get_db),
+):
+    alerts = db.scalars(
+        select(Alert)
+        .where(Alert.is_resolved.is_(False))
+        .order_by(Alert.id.desc())
+    ).all()
+
+    return [
+        {
+            "id": a.id,
+            "sensor_id": a.sensor_id,
+            "location": a.location,
+            "level": a.level,
+            "message": a.message,
+            "created_at": a.created_at,
+        }
+        for a in alerts
+    ]
+
+
+@app.post("/resident/bookings")
+def resident_create_booking(
+    data: ResidentBookingData,
+    current_user: User = Depends(require_role("resident")),
+    db: Session = Depends(get_db),
+):
+    booking = MaintenanceBooking(
+        customer_name=current_user.full_name,
+        phone=data.phone,
+        email=current_user.email,
+        location=data.location,
+        service_type=data.service_type,
+        booking_status="Pending",
+        payment_status="Pending",
+        amount=1000.0,
+    )
+
+    db.add(booking)
+    db.commit()
+    db.refresh(booking)
+
+    return {
+        "message": "Maintenance request submitted successfully",
+        "booking": _booking_dict(booking),
+    }
+
+
+@app.get("/resident/bookings")
+def resident_bookings(
+    current_user: User = Depends(require_role("resident")),
+    db: Session = Depends(get_db),
+):
+    bookings = db.scalars(
+        select(MaintenanceBooking)
+        .where(MaintenanceBooking.email == current_user.email)
+        .order_by(MaintenanceBooking.id.desc())
+    ).all()
+
+    return [_booking_dict(b) for b in bookings]
+
+
+@app.get("/resident/bookings/{booking_id}")
+def resident_booking_detail(
+    booking_id: int,
+    current_user: User = Depends(require_role("resident")),
+    db: Session = Depends(get_db),
+):
+    booking = db.get(MaintenanceBooking, booking_id)
+    if booking is None:
+        raise HTTPException(status_code=404, detail="Booking not found")
+    if booking.email != current_user.email:
+        raise HTTPException(status_code=403, detail="You can only view your own bookings")
+    return _booking_dict(booking)
+
+
+# --- Worker endpoints ---
+
+@app.get("/worker/jobs")
+def worker_jobs(
+    current_user: User = Depends(require_role("worker")),
+    db: Session = Depends(get_db),
+):
+    bookings = db.scalars(
+        select(MaintenanceBooking)
+        .where(MaintenanceBooking.assigned_worker_id == current_user.id)
+        .order_by(MaintenanceBooking.id.desc())
+    ).all()
+
+    return [_booking_dict(b) for b in bookings]
+
+
+@app.post("/worker/jobs/{booking_id}/accept")
+def worker_accept_job(
+    booking_id: int,
+    current_user: User = Depends(require_role("worker")),
+    db: Session = Depends(get_db),
+):
+    booking = db.get(MaintenanceBooking, booking_id)
+    if booking is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if booking.assigned_worker_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This job is not assigned to you")
+    if booking.booking_status != "Assigned":
+        raise HTTPException(status_code=400, detail="Job can only be accepted when status is Assigned")
+
+    booking.booking_status = "In Progress"
+    db.commit()
+    db.refresh(booking)
+
+    return {
+        "message": "Job accepted",
+        "booking": _booking_dict(booking),
+    }
+
+
+@app.post("/worker/jobs/{booking_id}/progress")
+def worker_start_progress(
+    booking_id: int,
+    current_user: User = Depends(require_role("worker")),
+    db: Session = Depends(get_db),
+):
+    booking = db.get(MaintenanceBooking, booking_id)
+    if booking is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if booking.assigned_worker_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This job is not assigned to you")
+
+    booking.booking_status = "In Progress"
+    db.commit()
+    db.refresh(booking)
+
+    return {
+        "message": "Job status updated to In Progress",
+        "booking": _booking_dict(booking),
+    }
+
+
+@app.post("/worker/jobs/{booking_id}/solve")
+def worker_solve_job(
+    booking_id: int,
+    current_user: User = Depends(require_role("worker")),
+    db: Session = Depends(get_db),
+):
+    booking = db.get(MaintenanceBooking, booking_id)
+    if booking is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if booking.assigned_worker_id != current_user.id:
+        raise HTTPException(status_code=403, detail="This job is not assigned to you")
+    if booking.booking_status != "In Progress":
+        raise HTTPException(status_code=400, detail="Job must be In Progress before it can be marked Solved")
+
+    booking.booking_status = "Solved"
+    db.commit()
+    db.refresh(booking)
+
+    return {
+        "message": "Job marked as Solved",
+        "booking": _booking_dict(booking),
+    }
+
+
+# --- Admin endpoints ---
+
+@app.get("/admin/dashboard")
+def admin_dashboard(
+    current_user: User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    latest = db.scalar(
+        select(SensorReading).order_by(SensorReading.id.desc())
+    )
+    total_readings = db.scalar(select(SensorReading.id).order_by(SensorReading.id.desc()))
+    active_alerts = db.scalars(
+        select(Alert).where(Alert.is_resolved.is_(False))
+    ).all()
+    all_bookings = db.scalars(select(MaintenanceBooking)).all()
+    pending_bookings = [b for b in all_bookings if b.booking_status == "Pending"]
+    assigned_bookings = [b for b in all_bookings if b.booking_status == "Assigned"]
+    in_progress_bookings = [b for b in all_bookings if b.booking_status == "In Progress"]
+    solved_bookings = [b for b in all_bookings if b.booking_status == "Solved"]
+    unpaid_bookings = [b for b in all_bookings if b.payment_status != "Paid"]
+
+    return {
+        "latest_reading": {
+            "sensor_id": latest.sensor_id if latest else None,
+            "location": latest.location if latest else None,
+            "water_level": latest.water_level if latest else None,
+            "temperature": latest.temperature if latest else None,
+            "gas_level": latest.gas_level if latest else None,
+            "status": latest.status if latest else "No data",
+            "created_at": latest.created_at if latest else None,
+        } if latest else None,
+        "total_readings": total_readings or 0,
+        "active_alerts": len(active_alerts),
+        "critical_alerts": len([a for a in active_alerts if a.level == "Critical"]),
+        "total_bookings": len(all_bookings),
+        "pending_bookings": len(pending_bookings),
+        "assigned_bookings": len(assigned_bookings),
+        "in_progress_bookings": len(in_progress_bookings),
+        "solved_bookings": len(solved_bookings),
+        "unpaid_bookings": len(unpaid_bookings),
+    }
+
+
+@app.get("/admin/maintenance-requests")
+def admin_maintenance_requests(
+    current_user: User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    bookings = db.scalars(
+        select(MaintenanceBooking)
+        .where(MaintenanceBooking.booking_status.in_(["Pending", "Assigned", "In Progress"]))
+        .order_by(MaintenanceBooking.id.desc())
+    ).all()
+
+    return [_booking_dict(b) for b in bookings]
+
+
+@app.get("/admin/workers")
+def admin_list_workers(
+    current_user: User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    workers = db.scalars(
+        select(User).where(User.role == "worker").order_by(User.id)
+    ).all()
+
+    return [
+        {
+            "id": w.id,
+            "username": w.username,
+            "full_name": w.full_name,
+            "email": w.email,
+        }
+        for w in workers
+    ]
+
+
+@app.post("/admin/bookings/{booking_id}/assign")
+def admin_assign_worker(
+    booking_id: int,
+    data: AssignWorkerData,
+    current_user: User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    booking = db.get(MaintenanceBooking, booking_id)
+    if booking is None:
+        raise HTTPException(status_code=404, detail="Booking not found")
+
+    worker = db.get(User, data.worker_id)
+    if worker is None or worker.role != "worker":
+        raise HTTPException(status_code=400, detail="Selected user is not a worker")
+
+    booking.assigned_worker_id = worker.id
+    booking.booking_status = "Assigned"
+    db.commit()
+    db.refresh(booking)
+
+    return {
+        "message": f"Job assigned to {worker.full_name}",
+        "booking": _booking_dict(booking),
+    }
+
+
+@app.get("/admin/worker-progress")
+def admin_worker_progress(
+    current_user: User = Depends(require_role("admin")),
+    db: Session = Depends(get_db),
+):
+    workers = db.scalars(
+        select(User).where(User.role == "worker").order_by(User.id)
+    ).all()
+
+    result = []
+    for w in workers:
+        jobs = db.scalars(
+            select(MaintenanceBooking)
+            .where(MaintenanceBooking.assigned_worker_id == w.id)
+            .order_by(MaintenanceBooking.id.desc())
+        ).all()
+        result.append({
+            "worker": {
+                "id": w.id,
+                "username": w.username,
+                "full_name": w.full_name,
+            },
+            "total_jobs": len(jobs),
+            "in_progress": len([j for j in jobs if j.booking_status == "In Progress"]),
+            "solved": len([j for j in jobs if j.booking_status == "Solved"]),
+            "unpaid": len([j for j in jobs if j.payment_status != "Paid"]),
+            "jobs": [_booking_dict(j) for j in jobs],
+        })
+
+    return result
