@@ -6,6 +6,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 from sqlalchemy import select, text
+from fastapi.responses import HTMLResponse
 
 
 from backend.database import Base, engine, get_db
@@ -73,9 +74,20 @@ def calculate_status(water_level, temperature, gas_level):
 
     return "Normal"
 
-def sync_alert(db: Session, reading: SensorReading):
 
-    # Find an existing unresolved alert for this sensor
+def sync_alert(db: Session, reading: SensorReading):
+    # Find the previous reading from this same physical/simulated sensor.
+    previous_reading = db.scalar(
+        select(SensorReading)
+        .where(
+            SensorReading.sensor_id == reading.sensor_id,
+            SensorReading.location == reading.location,
+            SensorReading.id < reading.id
+        )
+        .order_by(SensorReading.id.desc())
+    )
+
+    # Find the currently active alert for this sensor.
     active_alert = db.scalar(
         select(Alert)
         .where(
@@ -86,7 +98,11 @@ def sync_alert(db: Session, reading: SensorReading):
         .order_by(Alert.id.desc())
     )
 
-    # Resolve an existing alert when readings return to Normal
+    # No alert is needed when the status has not changed.
+    if previous_reading and previous_reading.status == reading.status:
+        return
+
+    # When the sensor returns to Normal, close the active alert.
     if reading.status == "Normal":
         if active_alert:
             active_alert.is_resolved = True
@@ -94,30 +110,28 @@ def sync_alert(db: Session, reading: SensorReading):
             db.commit()
         return
 
+    # A new Warning/Critical status creates a new history entry.
+    if active_alert:
+        active_alert.is_resolved = True
+        active_alert.resolved_at = datetime.now(timezone.utc)
+
     message = (
-        f"{reading.status}: Drainage readings exceeded "
-        "the configured demo thresholds."
+        f"{reading.status}: Drainage readings changed to "
+        f"{reading.status}."
     )
 
-    # Create a new alert if no unresolved alert exists
-    if active_alert is None:
-        new_alert = Alert(
-            sensor_id=reading.sensor_id,
-            location=reading.location,
-            reading_id=reading.id,
-            level=reading.status,
-            message=message,
-            is_resolved=False
-        )
-        db.add(new_alert)
+    new_alert = Alert(
+        sensor_id=reading.sensor_id,
+        location=reading.location,
+        reading_id=reading.id,
+        level=reading.status,
+        message=message,
+        is_resolved=False
+    )
 
-    else:
-        # Update the existing alert if the condition changes
-        active_alert.reading_id = reading.id
-        active_alert.level = reading.status
-        active_alert.message = message
-
+    db.add(new_alert)
     db.commit()
+
 
 
 
@@ -261,7 +275,7 @@ def simulate_sensor_reading(db: Session = Depends(get_db)):
 
 @app.get("/alerts")
 def get_alerts(
-    include_resolved: bool = False,
+    include_resolved: bool = True,
     db: Session = Depends(get_db)
 ):
 
@@ -409,14 +423,13 @@ def create_booking_payment(
             detail="PayPal request failed. Check the VS Code terminal."
     )
 
-    
-@app.get("/payment/success")
+
+@app.get("/payment/success", response_class=HTMLResponse)
 def paypal_payment_success(
     token: str,
     PayerID: str | None = None,
     db: Session = Depends(get_db)
 ):
-    # Find the booking associated with this PayPal order
     booking = db.scalar(
         select(MaintenanceBooking).where(
             MaintenanceBooking.paypal_order_id == token
@@ -430,59 +443,155 @@ def paypal_payment_success(
         )
 
     if booking.payment_status == "Paid":
-        return {
-            "message": "Payment was already completed",
-            "booking_id": booking.id,
-            "payment_status": "Paid"
-        }
+        status = "Payment Already Completed"
+        message = "Your payment has already been confirmed."
+        color = "#16a34a"
+    else:
+        try:
+            capture_result = capture_paypal_order(token)
+            print("PAYPAL CAPTURE RESPONSE:", capture_result)
 
-    try:
-        # Capture the approved payment through PayPal
-        capture_result = capture_paypal_order(token)
+            if capture_result.get("status") == "COMPLETED":
+                booking.payment_status = "Paid"
+                db.commit()
+                db.refresh(booking)
 
-        print("PAYPAL CAPTURE RESPONSE:", capture_result)
+                status = "Payment Successful!"
+                message = "Your payment has been completed successfully."
+                color = "#16a34a"
+            else:
+                status = "Payment Not Completed"
+                message = "PayPal has not confirmed your payment yet."
+                color = "#d97706"
 
-        # Only mark Paid when PayPal confirms COMPLETED
-        if capture_result.get("status") == "COMPLETED":
-            booking.payment_status = "Paid"
-            db.commit()
-            db.refresh(booking)
+        except requests.RequestException as error:
+            db.rollback()
+            print("PAYPAL CAPTURE ERROR:", repr(error))
 
-            return {
-                "message": "Payment completed successfully!",
-                "booking_id": booking.id,
-                "paypal_order_id": token,
-                "payment_status": booking.payment_status,
-                "paypal_status": capture_result["status"]
-            }
+            if error.response is not None:
+                print("PAYPAL RESPONSE:", error.response.text)
 
-        return {
-            "message": "Payment is not yet completed",
-            "booking_id": booking.id,
-            "payment_status": booking.payment_status,
-            "paypal_status": capture_result.get("status")
-        }
+            raise HTTPException(
+                status_code=502,
+                detail="PayPal payment capture failed. Check terminal."
+            )
 
-    except requests.RequestException as error:
-        db.rollback()
+    return HTMLResponse(f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{status} | DrainCare AI</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {{
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #f1f5f9;
+                font-family: Arial, sans-serif;
+            }}
+            .card {{
+                background: white;
+                width: 90%;
+                max-width: 430px;
+                padding: 35px 25px;
+                border-radius: 18px;
+                text-align: center;
+                box-shadow: 0 10px 35px rgba(0,0,0,0.08);
+                box-sizing: border-box;
+            }}
+            .icon {{
+                color: {color};
+                font-size: 65px;
+                margin-bottom: 15px;
+            }}
+            h1 {{ color: {color}; }}
+            .amount {{
+                font-size: 32px;
+                font-weight: bold;
+                margin: 25px 0;
+                color: #0f172a;
+            }}
+            .details {{
+                background: #f8fafc;
+                padding: 18px;
+                border-radius: 12px;
+                text-align: left;
+                line-height: 2;
+            }}
+            .footer {{
+                color: #64748b;
+                margin-top: 25px;
+                font-size: 14px;
+            }}
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="icon">&#10004;</div>
+            <h1>{status}</h1>
+            <p>{message}</p>
+            <div class="amount">₹{booking.amount}</div>
+            <div class="details">
+                <div>Booking ID: #{booking.id}</div>
+                <div>Payment Status: <b>{booking.payment_status}</b></div>
+                <div>Payment Gateway: PayPal Sandbox</div>
+            </div>
+            <div class="footer">
+                Thank you for using DrainCare AI!
+            </div>
+        </div>
+    </body>
+    </html>
+    """)
 
-        print("PAYPAL CAPTURE ERROR:", repr(error))
 
-        if error.response is not None:
-            print("PAYPAL RESPONSE:", error.response.text)
-
-        raise HTTPException(
-            status_code=502,
-            detail="PayPal payment capture failed. Check terminal."
-        )
-
-
-@app.get("/payment/cancel")
+@app.get("/payment/cancel", response_class=HTMLResponse)
 def paypal_payment_cancel():
-    return {
-        "message": "Payment was cancelled",
-        "payment_status": "Pending"
-    }
+    return HTMLResponse("""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Payment Cancelled | DrainCare AI</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                margin: 0;
+                min-height: 100vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #f1f5f9;
+                font-family: Arial, sans-serif;
+            }
+            .card {
+                background: white;
+                width: 90%;
+                max-width: 430px;
+                padding: 35px 25px;
+                border-radius: 18px;
+                text-align: center;
+                box-shadow: 0 10px 35px rgba(0,0,0,0.08);
+                box-sizing: border-box;
+            }
+            .icon { color: #dc2626; font-size: 65px; }
+            h1 { color: #dc2626; }
+            .footer { color: #64748b; margin-top: 25px; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
+            <div class="icon">&#10006;</div>
+            <h1>Payment Cancelled</h1>
+            <p>Your payment was cancelled. No payment was completed.</p>
+            <p><b>Payment Status: Pending</b></p>
+            <div class="footer">Thank you for using DrainCare AI!</div>
+        </div>
+    </body>
+    </html>
+    """)
 
 
 # ============================================================
@@ -537,7 +646,7 @@ def register(data: RegisterData, db: Session = Depends(get_db)):
         username=data.username,
         full_name=data.full_name,
         email=data.email,
-        role=data.role,
+        role="resident",
         password_hash=hash_password(data.password),
     )
     db.add(user)
@@ -644,9 +753,7 @@ def resident_alerts(
     db: Session = Depends(get_db),
 ):
     alerts = db.scalars(
-        select(Alert)
-        .where(Alert.is_resolved.is_(False))
-        .order_by(Alert.id.desc())
+        select(Alert).order_by(Alert.id.desc())
     ).all()
 
     return [
@@ -677,6 +784,7 @@ def resident_create_booking(
         booking_status="Pending",
         payment_status="Pending",
         amount=1000.0,
+        created_at=datetime.now(timezone.utc),
     )
 
     db.add(booking)

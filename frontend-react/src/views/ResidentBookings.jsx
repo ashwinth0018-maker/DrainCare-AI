@@ -96,13 +96,19 @@ export default function ResidentBookings({ onToast, onNavigatePayment }) {
             <div>
               <label className="text-xs text-slate-500 font-medium">Phone Number</label>
               <input
-                type="tel"
-                required
-                value={form.phone}
-                onChange={(e) => setForm({ ...form, phone: e.target.value })}
-                className="input-field mt-1"
-                placeholder="+91 98765 43210"
-              />
+              type="tel"
+              required
+              value={form.phone}
+              onChange={(e) => {
+                const digits = e.target.value.replace(/\D/g, "").slice(0, 10);
+                setForm({ ...form, phone: digits });
+              }}
+              pattern="[0-9]{10}"
+              minLength={10}
+              maxLength={10}
+              className="input-field mt-1"
+              placeholder="98765 43210"
+             />             
             </div>
             <div>
               <label className="text-xs text-slate-500 font-medium">Drainage Location</label>

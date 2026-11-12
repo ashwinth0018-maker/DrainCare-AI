@@ -36,16 +36,22 @@ function AppContent() {
   }, [])
 
   // Set default view based on role
-  useEffect(() => {
-    if (isAuthenticated && user && !activeView) {
-      const defaults = {
-        resident: 'resident-status',
-        worker: 'worker-jobs',
-        admin: 'admin-dashboard',
-      }
-      setActiveView(defaults[user.role] || 'overview')
-    }
-  }, [isAuthenticated, user, activeView])
+  // Reset dashboard whenever authentication or role changes
+useEffect(() => {
+  if (!isAuthenticated || !user) {
+    setActiveView(null)
+    setAlertCount(0)
+    return
+  }
+
+  const defaults = {
+    resident: 'resident-status',
+    worker: 'worker-jobs',
+    admin: 'admin-dashboard',
+  }
+
+  setActiveView(defaults[user.role] || 'overview')
+}, [isAuthenticated, user?.role])
 
   // Check for payment result URL
   useEffect(() => {

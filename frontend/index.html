@@ -334,6 +334,7 @@ async function loadBookings() {
 }
 
     
+
 async function loadAlerts() {
     const alertList = document.getElementById("alertList");
     const message = document.getElementById("alertMessage");
@@ -354,7 +355,7 @@ async function loadAlerts() {
             return;
         }
 
-        message.textContent = alerts.length + " active alert(s)";
+        message.textContent = alerts.length + " alert(s)";
 
         alerts.forEach(alert => {
             const card = document.createElement("div");
@@ -372,7 +373,25 @@ async function loadAlerts() {
             const details = document.createElement("p");
             details.textContent = alert.message;
 
-            card.append(heading, location, sensor, details);
+            const timestamp = document.createElement("p");
+            timestamp.textContent = alert.created_at
+                ? "Time: " + new Date(
+                    alert.created_at.endsWith("Z")
+                        ? alert.created_at
+                        : alert.created_at + "Z"
+                  ).toLocaleString("en-IN", {
+                    timeZone: "Asia/Kolkata",
+                    day: "2-digit",
+                    month: "2-digit",
+                    year: "numeric",
+                    hour: "2-digit",
+                    minute: "2-digit",
+                    second: "2-digit",
+                    hour12: true
+                  })
+                : "Time: Not available";
+
+            card.append(heading, location, sensor, details, timestamp);
             alertList.appendChild(card);
         });
 
@@ -380,6 +399,7 @@ async function loadAlerts() {
         message.textContent = error.message;
     }
 }
+
 
    
 async function loadReadings() {
@@ -434,11 +454,26 @@ async function loadReadings() {
             statusCell.className = "status " + reading.status;
             row.appendChild(statusCell);
             // Timestamp column
-               const timestampCell = document.createElement("td");
-               timestampCell.textContent = reading.created_at
-               ? new Date(reading.created_at).toLocaleString()
-               : "Not available";
-               row.appendChild(timestampCell);
+            const timestampCell = document.createElement("td");
+
+timestampCell.textContent = reading.created_at
+    ? new Date(
+        reading.created_at.endsWith("Z")
+            ? reading.created_at
+            : reading.created_at + "Z"
+      ).toLocaleString("en-IN", {
+          timeZone: "Asia/Kolkata",
+          day: "2-digit",
+          month: "2-digit",
+          year: "numeric",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: true
+      })
+    : "Not available";
+
+row.appendChild(timestampCell);
 
             const actionCell = document.createElement("td");
             const button = document.createElement("button");
